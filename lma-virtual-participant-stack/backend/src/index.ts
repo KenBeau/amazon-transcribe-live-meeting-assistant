@@ -35,6 +35,14 @@ const getCloakLaunchArgs = (fingerprintSeed: number): string[] => [
     `--fingerprint=${fingerprintSeed}`,
     `--fingerprint-screen-width=${WINDOW_WIDTH}`,
     `--fingerprint-screen-height=${WINDOW_HEIGHT}`,
+    // Disable cloakbrowser's canvas/WebGL/audio noise injection. Measured CPU
+    // impact was negligible with --disable-gpu (the cost is the software video
+    // encode, not the noise patch), and the bridged avatar looked maybe
+    // slightly cleaner. Kept because it's harmless for our use (Zoom already
+    // admits us, no canvas-hashing antibot to defeat) and keeps the avatar
+    // crisp. REVISIT: if we ever need maximum stealth against a canvas
+    // fingerprinting check, remove this flag to re-enable noise injection.
+    '--fingerprint-noise=false',
     // Size the headed OS window to fill the Xvfb display.
     `--window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT}`,
     '--window-position=0,0',
@@ -51,8 +59,15 @@ const getCloakLaunchArgs = (fingerprintSeed: number): string[] => [
     '--log-level=0',
     '--remote-debugging-port=9222',
     // Headed-in-container essentials.
-    '--use-angle=swiftshader',
-    '--ignore-gpu-blocklist',
+    // PERF ROUND 2: disable GPU entirely. There is no hardware GPU in the
+    // container, so Chrome runs all WebGL/compositing on the CPU via
+    // SwiftShader (the GPU process measured ~200% under load — the dominant
+    // cost). cloakbrowser force-adds --ignore-gpu-blocklist in headed mode to
+    // make WebGL work in Docker/Xvfb, but its arg-merge lets our args override
+    // by key. We don't need to SEE Zoom's video (we inject our own camera and
+    // consume audio), so disabling GPU/WebGL should shed the SwiftShader cost.
+    '--disable-gpu',
+    '--disable-software-rasterizer',
     '--disable-infobars',
     '--test-type',
     // Suppress password/autofill bubbles that overlay meeting UI buttons.
@@ -61,6 +76,15 @@ const getCloakLaunchArgs = (fingerprintSeed: number): string[] => [
     '--use-mock-keychain',
     '--no-first-run',
     '--no-default-browser-check',
+    // CloakBrowser's compiled WebRTC IP-leak patch suppresses ALL ICE host
+    // candidates by default, which prevents the Simli avatar's page-to-page
+    // WebRTC video bridge (Simli page -> meeting page) from ever connecting
+    // (connectionState stays 'new'). Both flags are required to restore host
+    // candidate gathering; verified empirically. Only the container's private
+    // RFC1918 IP is exposed, and no proxy is in use, so this leaks nothing the
+    // TCP connection doesn't already reveal. See simli-avatar.ts bridge.
+    '--force-webrtc-ip-handling-policy=default',
+    '--webrtc-ip-handling-policy=default',
 ];
 
 // Global variables for graceful shutdown
@@ -455,55 +479,15 @@ const main = async (): Promise<void> => {
             }
             console.log('✓ Camera and microphone permissions granted for meeting platforms');
             
-            // 2. Inject getUserMedia/enumerateDevices/permissions overrides (evaluateOnNewDocument)
+            // 2. Inject the getUserMedia override (installed in every frame via
+            //    addInitScript) and start the Node-side WebRTC bridge poll loop.
+            //    The loop scans page.frames() and services any frame that calls
+            //    getUserMedia({video}) — platform-agnostic, and it picks up new
+            //    subframes/navigations automatically, so no framenavigated or
+            //    on-demand-reconnect wiring is needed here (and exposeFunction
+            //    callbacks are unusable under cloakbrowser anyway).
             await simliAvatar.injectGetUserMediaOverride(page);
-            console.log('✓ Simli getUserMedia override injected into meeting page');
-            
-            let isReconnecting = false;
-            let reconnectInFlight: Promise<void> | null = null;
-            const connectSimliStream = async () => {
-                try {
-                    await simliAvatar.connectStreamToMeetingPage(page);
-                    console.log('✓ Simli video stream connected to meeting page');
-                } catch (error) {
-                    console.error('Failed to connect Simli stream (non-critical):', error);
-                }
-            };
-
-            await page.exposeFunction('__simliRequestReconnect', async () => {
-                if (reconnectInFlight) {
-                    await reconnectInFlight;
-                    return;
-                }
-                isReconnecting = true;
-                console.log('Simli avatar: on-demand reconnect requested from meeting page');
-                reconnectInFlight = connectSimliStream().finally(() => {
-                    reconnectInFlight = null;
-                    isReconnecting = false;
-                });
-                await reconnectInFlight;
-            });
-
-            // The getUserMedia override + frame relay are installed via
-            // evaluateOnNewDocument, so they survive meeting-URL navigations on
-            // their own. Confirm frames are flowing once per real meeting-URL load.
-            const isMeetingUrl = (u: string): boolean =>
-                /\/wc\/\d+\/(join|start|live)/.test(u) ||
-                /teams\.microsoft\.com\/.*meetup-join/.test(u) ||
-                /web\.webex\.com\/meeting/.test(u) ||
-                /chime\.aws\/meetings\//.test(u);
-            page.on('framenavigated', async (frame) => {
-                if (frame !== page.mainFrame()) return;
-                const url = frame.url();
-                if (!isMeetingUrl(url)) return;
-                if (reconnectInFlight) return;
-                console.log(`[simli-bridge] meeting URL detected — confirming avatar frames`);
-                reconnectInFlight = connectSimliStream().finally(() => {
-                    reconnectInFlight = null;
-                });
-                await reconnectInFlight;
-            });
-            
+            console.log('✓ Simli getUserMedia override + WebRTC bridge installed');
         } catch (error) {
             console.error('Failed to set up Simli avatar for meeting (non-critical):', error);
         }
