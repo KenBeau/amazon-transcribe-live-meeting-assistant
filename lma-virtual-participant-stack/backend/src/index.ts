@@ -31,7 +31,7 @@ import {
 const WINDOW_WIDTH = 1920;
 const WINDOW_HEIGHT = 1080;
 
-const getCloakLaunchArgs = (fingerprintSeed: number): string[] => [
+const getCloakLaunchArgs = (fingerprintSeed: number, simliEnabled: boolean): string[] => [
     `--fingerprint=${fingerprintSeed}`,
     `--fingerprint-screen-width=${WINDOW_WIDTH}`,
     `--fingerprint-screen-height=${WINDOW_HEIGHT}`,
@@ -42,7 +42,7 @@ const getCloakLaunchArgs = (fingerprintSeed: number): string[] => [
     // admits us, no canvas-hashing antibot to defeat) and keeps the avatar
     // crisp. REVISIT: if we ever need maximum stealth against a canvas
     // fingerprinting check, remove this flag to re-enable noise injection.
-    '--fingerprint-noise=false',
+    // '--fingerprint-noise=false',
     // Size the headed OS window to fill the Xvfb display.
     `--window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT}`,
     '--window-position=0,0',
@@ -85,6 +85,12 @@ const getCloakLaunchArgs = (fingerprintSeed: number): string[] => [
     // TCP connection doesn't already reveal. See simli-avatar.ts bridge.
     '--force-webrtc-ip-handling-policy=default',
     '--webrtc-ip-handling-policy=default',
+    // When Simli is NOT active we don't override getUserMedia, so without this
+    // Chrome reports no camera/mic — an unusual, fingerprintable state. The
+    // fake device gives a realistic capture device (better fingerprint). When
+    // Simli IS active we must NOT add it: it would register a competing fake
+    // camera alongside our injected avatar stream.
+    ...(simliEnabled ? [] : ['--use-fake-device-for-media-stream']),
 ];
 
 // Global variables for graceful shutdown
@@ -318,7 +324,7 @@ const main = async (): Promise<void> => {
         humanPreset: 'default',
         userDataDir,
         viewport: { width: WINDOW_WIDTH, height: WINDOW_HEIGHT },
-        args: getCloakLaunchArgs(fingerprintSeed),
+        args: getCloakLaunchArgs(fingerprintSeed, simliAvatar.isSimliEnabled()),
         launchOptions: {
             ignoreDefaultArgs: ['--mute-audio', '--enable-automation'],
         },
